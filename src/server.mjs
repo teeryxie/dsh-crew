@@ -67,6 +67,22 @@ function text(obj) {
   return { content: [{ type: 'text', text: typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2) }] };
 }
 
+/**
+ * The official subagent contract: a call returns `started subagent <childId>`
+ * as soon as the runtime accepts the child, and the activation owns the work.
+ * The child id is echoed first so a caller can copy it straight into
+ * dsh_worker_result; the job view follows for progress and token accounting.
+ */
+function startedReply(view) {
+  const childId = view?.id ?? view?.job_id ?? 'unknown';
+  return {
+    content: [{
+      type: 'text',
+      text: JSON.stringify({ started: `started subagent ${childId}`, child_id: childId, ...view }, null, 2),
+    }],
+  };
+}
+
 // Which orchestrator spawned this MCP server — stamped on every job so the
 // panel can show where a dispatch came from.
 const ORCHESTRATOR = detectOrchestrator();
@@ -137,8 +153,8 @@ async function resolveMode() {
 }
 
 server.registerTool('dsh_run_worker', {
-  title: 'Run DSH worker (blocking)',
-  description: 'Run one DSH (DeepSeek Harness) coding agent task and block until it finishes. Tier guidance: flash for mechanical, well-scoped work (single-file edits, lookups, formatting); pro for multi-file changes, debugging, and design judgment. The task string must be self-contained: the worker has zero conversation context, so include absolute paths, exact acceptance criteria, and constraints. Set worker="agy" or "grok" only when the user explicitly asks for that CLI, never as a default. Guardrails refuse (never queue) worker→worker recursion beyond the origin-chain depth cap and a second writer on the same cwd; allow_concurrent_cwd: true only for read-only tasks.',
+  title: 'Run DSH worker (non-blocking)',
+  description: 'Start a DSH (DeepSeek Harness) coding agent on a self-contained task. Every call returns `started subagent <childId>` as soon as the runtime accepts the child and does NOT wait for its result; the activation owns the work independently of the completed tool call. Continue useful work while it runs, or start several independent delegations together in one message. When only waiting for results remains, end your turn instead of sleeping or polling — read the result later with dsh_worker_result. Tier guidance: flash for mechanical, well-scoped work (single-file edits, lookups, formatting); pro for multi-file changes, debugging, and design judgment. The task string must be self-contained: the worker has zero conversation context, so include absolute paths, exact acceptance criteria, and constraints. Set worker="agy" or "grok" only when the user explicitly asks for that CLI, never as a default. Guardrails refuse (never queue) worker→worker recursion beyond the origin-chain depth cap and a second writer on the same cwd; allow_concurrent_cwd: true only for read-only tasks. Pass wait_seconds only when a blocking result is genuinely required.',
   inputSchema: {
     task: z.string().describe('Full task description for the worker, self-contained'),
     tier: tierSchema,
@@ -146,13 +162,15 @@ server.registerTool('dsh_run_worker', {
     worker: workerSchema,
     cwd: z.string().optional().describe('Workspace directory for the worker. Relative paths resolve against the caller\'s current workspace; "." or "current" mean the current workspace. Omit for the current workspace.'),
     timeout_seconds: z.number().int().positive().max(7200).optional(),
+    wait_seconds: z.number().int().min(0).max(7200).default(0).describe('0 (default) returns started subagent <childId> immediately, matching a runtime-owned activation. A positive value blocks up to that many seconds and returns the final result instead — use it only when the caller cannot continue without the answer.'),
     allow_concurrent_cwd: allowConcurrentCwdSchema,
   },
-}, async ({ task, tier, effort, worker, cwd, timeout_seconds, allow_concurrent_cwd }) => {
+}, async ({ task, tier, effort, worker, cwd, timeout_seconds, wait_seconds, allow_concurrent_cwd }) => {
   if (!sessionConfig.enabled) return dispatchDisabled();
   const workDir = resolveWorkerCwd(cwd);
   const e = effort ?? sessionConfig.default_effort;
-  const timeout = timeout_seconds ?? sessionConfig.default_timeout_seconds;
+  const blocking = wait_seconds > 0;
+  const timeout = blocking ? wait_seconds : (timeout_seconds ?? sessionConfig.default_timeout_seconds);
   const depthLimit = depthLimitNow();
 
   // CLI profile dispatch: worker= names a profile and bypasses the
@@ -169,6 +187,7 @@ server.registerTool('dsh_run_worker', {
       if (err instanceof CwdLockError) return text({ error: err.message, rejected_by: 'cwd-lock', holder: err.holder });
       throw err;
     }
+    if (!blocking) return startedReply(job);
     await waitJob(job.id, timeout * 1000);
     const view = jobView(job, { withResult: true });
     if (view.status === 'running') return text({ ...view, note: `still running after ${timeout}s; poll with dsh_worker_result` });
@@ -198,6 +217,7 @@ server.registerTool('dsh_run_worker', {
       // The hub client slices this wait internally; a single request that
       // waits minutes would be cut by undici's 300 s header timeout and
       // reported as a bare "fetch failed" while the job kept running.
+      if (!blocking) { attachOrigin(spawned, spawned.id); return { view: spawned }; }
       const got = await hub.get(spawned.id, timeout);
       attachOrigin(got, spawned.id);
       if (got.status !== 'running') releaseCwdLockByJobId(spawned.id);
@@ -212,6 +232,7 @@ server.registerTool('dsh_run_worker', {
       if (err instanceof CwdLockError) return { refusal: text({ error: err.message, rejected_by: 'cwd-lock', holder: err.holder }) };
       throw err;
     }
+    if (!blocking) return { view: jobView(job) };
     await waitJob(job.id, timeout * 1000);
     return { view: jobView(job, { withResult: true }) };
   };
@@ -220,6 +241,11 @@ server.registerTool('dsh_run_worker', {
   let res = await runOnce(firstTier);
   if (res.refusal) return res.refusal;
   let job = res.view;
+
+  // Non-blocking dispatch: the official contract returns the child id and
+  // leaves the activation to the runtime. No escalation here — there is no
+  // result yet to decide on.
+  if (!blocking) return startedReply(job);
   if (job.status === 'running') return text({ ...job, note: `still running after ${timeout}s; poll with dsh_worker_result` });
 
   // Escalate on evidence, not prediction: a failed flash run retries once on
